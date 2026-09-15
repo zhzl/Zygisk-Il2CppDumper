@@ -12,6 +12,10 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <algorithm>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -24,6 +28,44 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+static void dump_runtime_il2cpp(const char *outDir) {
+    auto outPath = std::string(outDir).append("/files/libil2cpp_runtime.bin");
+    std::ofstream out(outPath, std::ios::binary);
+    std::ifstream maps("/proc/self/maps");
+    int mem = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if (!out || !maps || mem < 0) {
+        LOGE("Runtime memory capture unavailable: %d", errno);
+        return;
+    }
+    std::string line;
+    char buffer[0x10000];
+    size_t regions = 0;
+    while (std::getline(maps, line)) {
+        if (line.find("libil2cpp.so") == std::string::npos) {
+            continue;
+        }
+        uint64_t start = 0, end = 0;
+        char perms[5] = {};
+        if (sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) != 3 ||
+            end <= start || perms[0] != 'r') {
+            continue;
+        }
+        out.write(reinterpret_cast<const char *>(&start), sizeof(start));
+        out.write(reinterpret_cast<const char *>(&end), sizeof(end));
+        for (uint64_t pos = start; pos < end;) {
+            size_t want = (size_t) std::min<uint64_t>(sizeof(buffer), end - pos);
+            ssize_t got = pread64(mem, buffer, want, (off64_t) pos);
+            if (got <= 0) break;
+            out.write(buffer, got);
+            pos += (size_t) got;
+        }
+        ++regions;
+    }
+    close(mem);
+    out.close();
+    LOGI("Runtime libil2cpp capture finished: %zu regions, %s", regions, outPath.c_str());
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -372,6 +414,7 @@ void il2cpp_dump(const char *outDir) {
     sample << "il2cpp_base=0x" << std::hex << il2cpp_base << "\n";
     sample.close();
     LOGI("Runtime sample marker written: %s", samplePath.c_str());
+    dump_runtime_il2cpp(outDir);
     return;
 
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
