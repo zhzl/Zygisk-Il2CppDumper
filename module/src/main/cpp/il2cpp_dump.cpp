@@ -325,8 +325,7 @@ std::string dump_type(const Il2CppType *type) {
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
-    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies ||
-        !il2cpp_thread_attach) {
+    if (!il2cpp_domain_get || !il2cpp_thread_attach) {
         LOGE("Required IL2CPP APIs are missing");
         return;
     }
@@ -354,7 +353,7 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("Starting dump: %s", outDir ? outDir : "<null>");
-    if (!outDir || !il2cpp_domain_get || !il2cpp_domain_get_assemblies) {
+    if (!outDir || !il2cpp_domain_get) {
         LOGE("Cannot dump: IL2CPP is not initialized");
         return;
     }
@@ -364,6 +363,17 @@ void il2cpp_dump(const char *outDir) {
         LOGE("Cannot dump: il2cpp domain is null");
         return;
     }
+    // The protected build terminates the process when this exported API is
+    // called. Keep the process alive for runtime memory capture instead.
+    LOGI("Runtime sampling mode: skipping il2cpp_domain_get_assemblies");
+    auto samplePath = std::string(outDir).append("/files/il2cpp_sample.txt");
+    std::ofstream sample(samplePath);
+    sample << "domain=" << domain << "\n";
+    sample << "il2cpp_base=0x" << std::hex << il2cpp_base << "\n";
+    sample.close();
+    LOGI("Runtime sample marker written: %s", samplePath.c_str());
+    return;
+
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
     if (!assemblies || size == 0) {
         LOGE("Cannot dump: no assemblies available");
