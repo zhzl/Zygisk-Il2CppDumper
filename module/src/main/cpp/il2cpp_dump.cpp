@@ -13,8 +13,6 @@
 #include <fstream>
 #include <unistd.h>
 #include <sys/types.h>
-#include <fcntl.h>
-#include <cerrno>
 #include <algorithm>
 #include "xdl.h"
 #include "log.h"
@@ -33,9 +31,8 @@ static void dump_runtime_il2cpp(const char *outDir) {
     auto outPath = std::string(outDir).append("/files/libil2cpp_runtime.bin");
     std::ofstream out(outPath, std::ios::binary);
     std::ifstream maps("/proc/self/maps");
-    int mem = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
-    if (!out || !maps || mem < 0) {
-        LOGE("Runtime memory capture unavailable: %d", errno);
+    if (!out || !maps) {
+        LOGE("Runtime memory capture unavailable");
         return;
     }
     std::string line;
@@ -55,14 +52,12 @@ static void dump_runtime_il2cpp(const char *outDir) {
         out.write(reinterpret_cast<const char *>(&end), sizeof(end));
         for (uint64_t pos = start; pos < end;) {
             size_t want = (size_t) std::min<uint64_t>(sizeof(buffer), end - pos);
-            ssize_t got = pread64(mem, buffer, want, (off64_t) pos);
-            if (got <= 0) break;
-            out.write(buffer, got);
-            pos += (size_t) got;
+            memcpy(buffer, reinterpret_cast<const void *>(pos), want);
+            out.write(buffer, (std::streamsize) want);
+            pos += want;
         }
         ++regions;
     }
-    close(mem);
     out.close();
     LOGI("Runtime libil2cpp capture finished: %zu regions, %s", regions, outPath.c_str());
 }
