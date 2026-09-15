@@ -369,11 +369,33 @@ void il2cpp_dump(const char *outDir) {
         LOGE("Cannot dump: no assemblies available");
         return;
     }
+    LOGI("Assemblies available: %zu", size);
+    if (!il2cpp_assembly_get_image || !il2cpp_image_get_name) {
+        LOGE("Cannot dump: image APIs are missing");
+        return;
+    }
     std::stringstream imageOutput;
     for (int i = 0; i < size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
-        imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
+        if (!image) {
+            LOGE("Image %d is null", i);
+            continue;
+        }
+        auto imageName = il2cpp_image_get_name(image);
+        if (!imageName) {
+            LOGE("Image %d name is null", i);
+            continue;
+        }
+        LOGI("Image %d/%zu: %s", i + 1, size, imageName);
+        imageOutput << "// Image " << i << ": " << imageName << "\n";
     }
+    auto imageOnlyPath = std::string(outDir).append("/files/assemblies.txt");
+    std::ofstream imageOnlyStream(imageOnlyPath);
+    imageOnlyStream << imageOutput.str();
+    imageOnlyStream.close();
+    LOGI("Assembly enumeration finished: %s", imageOnlyPath.c_str());
+    LOGI("Class traversal disabled for diagnostic run");
+    return;
     std::vector<std::string> outPuts;
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
