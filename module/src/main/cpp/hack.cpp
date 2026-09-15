@@ -23,8 +23,10 @@ void hack_start(const char *game_data_dir) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
+            LOGI("libil2cpp.so loaded, initializing dumper");
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            LOGI("dumper thread completed");
             break;
         } else {
             sleep(1);
@@ -113,7 +115,8 @@ struct NativeBridgeCallbacks {
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
     //TODO 等待houdini初始化
-    sleep(5);
+    LOGI("Waiting 10 seconds for Houdini and Unity initialization");
+    sleep(10);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
