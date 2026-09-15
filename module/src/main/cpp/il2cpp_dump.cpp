@@ -5,6 +5,8 @@
 #include "il2cpp_dump.h"
 #include <dlfcn.h>
 #include <cstdlib>
+#include <cstdio>
+#include <unordered_set>
 #include <cstring>
 #include <cinttypes>
 #include <string>
@@ -27,82 +29,104 @@
 
 static uint64_t il2cpp_base = 0;
 
-static void scan_metadata_registration(const char *outDir) {
+// Unity 2022 ARM64 registration: seven count/pointer pairs, then an unused pair.
+// Locate and validate the type table; never call the assembly enumeration API.
+struct RegistrationView {
+    uint64_t address = 0;
+    uint64_t types = 0;
+    size_t typeCount = 0;
+    size_t definitionCount = 0;
+};
+struct ReadableRange { uint64_t start, end; };
+
+static uint64_t read_u64(uint64_t address) {
+    uint64_t value;
+    std::memcpy(&value, reinterpret_cast<const void *>(address), sizeof(value));
+    return value;
+}
+
+static bool contains(const std::vector<ReadableRange> &ranges, uint64_t address, uint64_t size) {
+    for (const auto &r : ranges) {
+        if (address >= r.start && address < r.end && size <= r.end - address) return true;
+    }
+    return false;
+}
+
+static bool valid_type_kind(uint8_t kind) {
+    return (kind >= 1 && kind <= 0x16) || kind == 0x18 || kind == 0x19 ||
+           kind == 0x1b || kind == 0x1c || kind == 0x1d || kind == 0x1e;
+}
+
+static bool definition_type(uint8_t kind) {
+    // Exclude constructed generics, arrays, pointers and generic parameters.
+    return (kind >= 1 && kind <= 0x0e) || kind == 0x11 || kind == 0x12 ||
+           kind == 0x16 || kind == 0x18 || kind == 0x19 || kind == 0x1c;
+}
+
+static bool scan_metadata_registration(const char *outDir, RegistrationView &result) {
+    if (sizeof(void *) != 8) {
+        LOGE("Registration layout currently supports 64-bit IL2CPP only");
+        return false;
+    }
     std::ifstream maps("/proc/self/maps");
-    if (!maps) return;
-    struct Range { uint64_t start, end; };
-    std::vector<Range> ranges;
+    if (!maps) { LOGE("Cannot read process mappings"); return false; }
+    std::vector<ReadableRange> ranges;
     std::string line;
     while (std::getline(maps, line)) {
         if (line.find("libil2cpp.so") == std::string::npos) continue;
-        uint64_t start = 0, end = 0; char perms[5] = {};
-        if (sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) == 3 &&
-            end > start && perms[0] == 'r') ranges.push_back({start, end});
-    }
-    auto inRange = [&ranges](uint64_t p) {
-        for (const auto &r : ranges) if (p >= r.start && p < r.end) return true;
-        return false;
-    };
-    for (const auto &r : ranges) {
-        for (uint64_t p = (r.start + 7) & ~7ULL; p + 7 * 16 <= r.end; p += 8) {
-            bool valid = true;
-            for (int i = 0; i < 7; ++i) {
-                auto count = *reinterpret_cast<const uint32_t *>(p + i * 16);
-                auto ptr = *reinterpret_cast<const uint64_t *>(p + i * 16 + 8);
-                if (count < 1000 || count > 300000 || !inRange(ptr)) { valid = false; break; }
-            }
-            if (valid) {
-                auto path = std::string(outDir).append("/files/metadata_registration.txt");
-                std::ofstream out(path);
-                out << "address=0x" << std::hex << p << "\n";
-                for (int i = 0; i < 7; ++i) {
-                    out << "field" << i << "_count=" << std::dec
-                        << *reinterpret_cast<const uint32_t *>(p + i * 16)
-                        << " ptr=0x" << std::hex
-                        << *reinterpret_cast<const uint64_t *>(p + i * 16 + 8) << "\n";
-                }
-                LOGI("Metadata registration candidate: 0x%" PRIx64, p);
-                return;
-            }
-        }
-    }
-    LOGI("No metadata registration candidate found");
-}
-
-static void dump_runtime_il2cpp(const char *outDir) {
-    auto outPath = std::string(outDir).append("/files/libil2cpp_runtime.bin");
-    std::ofstream out(outPath, std::ios::binary);
-    std::ifstream maps("/proc/self/maps");
-    if (!out || !maps) {
-        LOGE("Runtime memory capture unavailable");
-        return;
-    }
-    std::string line;
-    char buffer[0x10000];
-    size_t regions = 0;
-    while (std::getline(maps, line)) {
-        if (line.find("libil2cpp.so") == std::string::npos) {
-            continue;
-        }
         uint64_t start = 0, end = 0;
         char perms[5] = {};
-        if (sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) != 3 ||
-            end <= start || perms[0] != 'r') {
-            continue;
-        }
-        out.write(reinterpret_cast<const char *>(&start), sizeof(start));
-        out.write(reinterpret_cast<const char *>(&end), sizeof(end));
-        for (uint64_t pos = start; pos < end;) {
-            size_t want = (size_t) std::min<uint64_t>(sizeof(buffer), end - pos);
-            memcpy(buffer, reinterpret_cast<const void *>(pos), want);
-            out.write(buffer, (std::streamsize) want);
-            pos += want;
-        }
-        ++regions;
+        if (std::sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) == 3 &&
+            end > start && perms[0] == 'r') ranges.push_back({start, end});
     }
+    size_t candidates = 0;
+    for (const auto &r : ranges) {
+        if (r.end - r.start < 128) continue;
+        for (uint64_t address = (r.start + 7) & ~uint64_t(7);
+             address <= r.end - 128; address += 8) {
+            uint64_t counts[7] = {}, pointers[7] = {};
+            const uint64_t elementSizes[7] = {8, 8, 16, 8, 12, 8, 8};
+            bool valid = true;
+            for (size_t i = 0; i < 7; ++i) {
+                counts[i] = read_u64(address + i * 16);
+                pointers[i] = read_u64(address + i * 16 + 8);
+                if (counts[i] < 1000 || counts[i] > 300000 ||
+                    !contains(ranges, pointers[i], counts[i] * elementSizes[i])) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid || counts[5] != counts[6] || counts[3] < counts[5] ||
+                read_u64(address + 112) != 0 || read_u64(address + 120) != 0) continue;
+            for (uint64_t i = 0; i < counts[3]; ++i) {
+                auto type = read_u64(pointers[3] + i * 8);
+                if (type % 8 != 0 || !contains(ranges, type, 16)) { valid = false; break; }
+                auto bits = static_cast<uint32_t>(read_u64(type + 8));
+                if (!valid_type_kind(static_cast<uint8_t>(bits >> 16))) { valid = false; break; }
+            }
+            if (!valid) continue;
+            result = {address, pointers[3], static_cast<size_t>(counts[3]),
+                      static_cast<size_t>(counts[5])};
+            ++candidates;
+        }
+    }
+    if (candidates != 1) {
+        LOGE("Expected one validated registration, found %zu; refusing to guess", candidates);
+        return false;
+    }
+    std::ofstream out(std::string(outDir) + "/files/metadata_registration.txt");
+    out << "address=0x" << std::hex << result.address << "\n"
+        << "types=0x" << result.types << "\n"
+        << "type_count=" << std::dec << result.typeCount << "\n"
+        << "definition_count=" << result.definitionCount << "\n";
     out.close();
-    LOGI("Runtime libil2cpp capture finished: %zu regions, %s", regions, outPath.c_str());
+    if (!out) LOGE("Cannot save registration report");
+    LOGI("Validated registration: 0x%" PRIx64 ", types=%zu, definitions=%zu",
+         result.address, result.typeCount, result.definitionCount);
+    return true;
 }
+
+static bool api_ready = false;
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -164,11 +188,7 @@ std::string get_method_modifier(uint32_t flags) {
 }
 
 bool _il2cpp_type_is_byref(const Il2CppType *type) {
-    auto byref = type->byref;
-    if (il2cpp_type_is_byref) {
-        byref = il2cpp_type_is_byref(type);
-    }
-    return byref;
+    return type && il2cpp_type_is_byref(type);
 }
 
 std::string dump_method(Il2CppClass *klass) {
@@ -203,7 +223,7 @@ std::string dump_method(Il2CppClass *klass) {
         auto param_count = il2cpp_method_get_param_count(method);
         for (int i = 0; i < param_count; ++i) {
             auto param = il2cpp_method_get_param(method, i);
-            auto attrs = param->attrs;
+            auto attrs = il2cpp_type_get_attrs(param);
             if (_il2cpp_type_is_byref(param)) {
                 if (attrs & PARAM_ATTRIBUTE_OUT && !(attrs & PARAM_ATTRIBUTE_IN)) {
                     outPut << "out ";
@@ -325,9 +345,8 @@ std::string dump_field(Il2CppClass *klass) {
     return outPut.str();
 }
 
-std::string dump_type(const Il2CppType *type) {
+std::string dump_type(Il2CppClass *klass) {
     std::stringstream outPut;
-    auto *klass = il2cpp_class_from_type(type);
     outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
     auto flags = il2cpp_class_get_flags(klass);
     if (flags & TYPE_ATTRIBUTE_SERIALIZABLE) {
@@ -402,162 +421,115 @@ std::string dump_type(const Il2CppType *type) {
 }
 
 void il2cpp_api_init(void *handle) {
+    api_ready = false;
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
     if (!il2cpp_domain_get || !il2cpp_thread_attach) {
-        LOGE("Required IL2CPP APIs are missing");
+        LOGE("Required initialization APIs are missing");
         return;
     }
-    if (il2cpp_domain_get_assemblies) {
-        Dl_info dlInfo{};
-        if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
-        LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void *>(il2cpp_domain_get), &info) || !info.dli_fbase) {
+        LOGE("Cannot resolve il2cpp base");
+        return;
     }
-    // il2cpp_is_vm_thread(nullptr) is unreliable on recent Unity/Houdini.
+    il2cpp_base = reinterpret_cast<uint64_t>(info.dli_fbase);
+    LOGI("il2cpp_base: %" PRIx64, il2cpp_base);
     for (int i = 0; i < 30; ++i) {
         auto domain = il2cpp_domain_get();
-        if (domain != nullptr) {
-            LOGI("il2cpp domain ready: %p", domain);
+        if (domain) {
+            LOGI("il2cpp domain ready: %p", static_cast<void *>(domain));
             auto thread = il2cpp_thread_attach(domain);
-            LOGI("il2cpp thread attached: %p", thread);
+            LOGI("il2cpp thread attached: %p", static_cast<void *>(thread));
+            api_ready = thread != nullptr;
             return;
         }
-        LOGI("Waiting for il2cpp domain: %d/30", i + 1);
         sleep(1);
     }
     LOGE("il2cpp domain timeout");
 }
 
 void il2cpp_dump(const char *outDir) {
-    LOGI("Starting dump: %s", outDir ? outDir : "<null>");
-    if (!outDir || !il2cpp_domain_get) {
-        LOGE("Cannot dump: IL2CPP is not initialized");
+    LOGI("Registration dump v2: assembly enumeration disabled");
+    if (!outDir || !api_ready) { LOGE("Cannot dump: initialization failed"); return; }
+#define REQUIRE_API(name) if (!name) { LOGE("Required dump API missing: %s", #name); return; }
+    REQUIRE_API(il2cpp_class_from_type);
+    REQUIRE_API(il2cpp_class_get_fields);
+    REQUIRE_API(il2cpp_class_get_flags);
+    REQUIRE_API(il2cpp_class_get_image);
+    REQUIRE_API(il2cpp_class_get_interfaces);
+    REQUIRE_API(il2cpp_class_get_methods);
+    REQUIRE_API(il2cpp_class_get_name);
+    REQUIRE_API(il2cpp_class_get_namespace);
+    REQUIRE_API(il2cpp_class_get_parent);
+    REQUIRE_API(il2cpp_class_get_properties);
+    REQUIRE_API(il2cpp_class_get_type);
+    REQUIRE_API(il2cpp_class_is_enum);
+    REQUIRE_API(il2cpp_class_is_valuetype);
+    REQUIRE_API(il2cpp_field_get_flags);
+    REQUIRE_API(il2cpp_field_get_name);
+    REQUIRE_API(il2cpp_field_get_offset);
+    REQUIRE_API(il2cpp_field_get_type);
+    REQUIRE_API(il2cpp_field_static_get_value);
+    REQUIRE_API(il2cpp_image_get_name);
+    REQUIRE_API(il2cpp_method_get_flags);
+    REQUIRE_API(il2cpp_method_get_name);
+    REQUIRE_API(il2cpp_method_get_param);
+    REQUIRE_API(il2cpp_method_get_param_count);
+    REQUIRE_API(il2cpp_method_get_param_name);
+    REQUIRE_API(il2cpp_method_get_return_type);
+    REQUIRE_API(il2cpp_property_get_get_method);
+    REQUIRE_API(il2cpp_property_get_name);
+    REQUIRE_API(il2cpp_property_get_set_method);
+    REQUIRE_API(il2cpp_type_get_attrs);
+    REQUIRE_API(il2cpp_type_is_byref);
+#undef REQUIRE_API
+    RegistrationView registration;
+    if (!scan_metadata_registration(outDir, registration)) return;
+    const auto finalPath = std::string(outDir) + "/files/dump.cs";
+    const auto partialPath = finalPath + ".partial";
+    std::ofstream out(partialPath, std::ios::trunc);
+    if (!out) { LOGE("Cannot open partial dump file"); return; }
+    out << "// IL2CPP dump via validated registration type table.\n"
+        << "// Constructed generic types, arrays and generic parameters are excluded.\n"
+        << "// Registered definitions: " << registration.definitionCount << "\n";
+    std::unordered_set<Il2CppClass *> seen;
+    size_t written = 0, unresolved = 0;
+    for (size_t i = 0; i < registration.typeCount; ++i) {
+        auto address = read_u64(registration.types + i * 8);
+        auto bits = static_cast<uint32_t>(read_u64(address + 8));
+        if (!definition_type(static_cast<uint8_t>(bits >> 16))) continue;
+        // Flush the index before APIs so an interrupted dump identifies the last entry.
+        out << "\n// Type table index: " << i << "\n";
+        out.flush();
+        if (!out) { LOGE("Partial dump write failed"); return; }
+        auto type = reinterpret_cast<const Il2CppType *>(address);
+        auto klass = il2cpp_class_from_type(type);
+        if (!klass) { ++unresolved; continue; }
+        if (!seen.insert(klass).second) continue;
+        auto image = il2cpp_class_get_image(klass);
+        auto imageName = image ? il2cpp_image_get_name(image) : nullptr;
+        if (!imageName) { LOGE("Class has no image at index %zu", i); return; }
+        out << "// Dll : " << imageName << "\n";
+        out << dump_type(klass);
+        out.flush();
+        if (!out) { LOGE("Partial dump write failed"); return; }
+        ++written;
+        if (written == 1 || written % 128 == 0) {
+            LOGI("Registration dump progress: %zu classes, table index %zu/%zu",
+                 written, i + 1, registration.typeCount);
+        }
+    }
+    out << "\n// Traversal ended: " << written << " classes; " << unresolved << " unresolved entries.\n";
+    out.close();
+    if (!out || written == 0 || unresolved != 0 || written != registration.definitionCount) {
+        LOGE("Incomplete dump retained at %s: %zu/%zu classes, %zu unresolved entries",
+             partialPath.c_str(), written, registration.definitionCount, unresolved);
         return;
     }
-    size_t size;
-    auto domain = il2cpp_domain_get();
-    if (!domain) {
-        LOGE("Cannot dump: il2cpp domain is null");
+    if (std::rename(partialPath.c_str(), finalPath.c_str()) != 0) {
+        LOGE("Cannot rename partial dump to %s", finalPath.c_str());
         return;
     }
-    // The protected build terminates the process when this exported API is
-    // called. Keep the process alive for runtime memory capture instead.
-    LOGI("Runtime sampling mode: skipping il2cpp_domain_get_assemblies");
-    auto samplePath = std::string(outDir).append("/files/il2cpp_sample.txt");
-    std::ofstream sample(samplePath);
-    sample << "domain=" << domain << "\n";
-    sample << "il2cpp_base=0x" << std::hex << il2cpp_base << "\n";
-    sample.close();
-    LOGI("Runtime sample marker written: %s", samplePath.c_str());
-    scan_metadata_registration(outDir);
-    dump_runtime_il2cpp(outDir);
-    return;
-
-    auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
-    if (!assemblies || size == 0) {
-        LOGE("Cannot dump: no assemblies available");
-        return;
-    }
-    LOGI("Assemblies available: %zu", size);
-    if (!il2cpp_assembly_get_image || !il2cpp_image_get_name) {
-        LOGE("Cannot dump: image APIs are missing");
-        return;
-    }
-    std::stringstream imageOutput;
-    for (int i = 0; i < size; ++i) {
-        auto image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) {
-            LOGE("Image %d is null", i);
-            continue;
-        }
-        auto imageName = il2cpp_image_get_name(image);
-        if (!imageName) {
-            LOGE("Image %d name is null", i);
-            continue;
-        }
-        LOGI("Image %d/%zu: %s", i + 1, size, imageName);
-        imageOutput << "// Image " << i << ": " << imageName << "\n";
-    }
-    auto imageOnlyPath = std::string(outDir).append("/files/assemblies.txt");
-    std::ofstream imageOnlyStream(imageOnlyPath);
-    imageOnlyStream << imageOutput.str();
-    imageOnlyStream.close();
-    LOGI("Assembly enumeration finished: %s", imageOnlyPath.c_str());
-    LOGI("Class traversal disabled for diagnostic run");
-    return;
-    std::vector<std::string> outPuts;
-    if (il2cpp_image_get_class) {
-        LOGI("Version greater than 2018.3");
-        //使用il2cpp_image_get_class
-        for (int i = 0; i < size; ++i) {
-            auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
-            imageStr << "\n// Dll : " << il2cpp_image_get_name(image);
-            auto classCount = il2cpp_image_get_class_count(image);
-            for (int j = 0; j < classCount; ++j) {
-                auto klass = il2cpp_image_get_class(image, j);
-                auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
-            }
-        }
-    } else {
-        LOGI("Version less than 2018.3");
-        //使用反射
-        auto corlib = il2cpp_get_corlib();
-        auto assemblyClass = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
-        auto assemblyLoad = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
-        auto assemblyGetTypes = il2cpp_class_get_method_from_name(assemblyClass, "GetTypes", 0);
-        if (assemblyLoad && assemblyLoad->methodPointer) {
-            LOGI("Assembly::Load: %p", assemblyLoad->methodPointer);
-        } else {
-            LOGI("miss Assembly::Load");
-            return;
-        }
-        if (assemblyGetTypes && assemblyGetTypes->methodPointer) {
-            LOGI("Assembly::GetTypes: %p", assemblyGetTypes->methodPointer);
-        } else {
-            LOGI("miss Assembly::GetTypes");
-            return;
-        }
-        typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
-        typedef Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
-        for (int i = 0; i < size; ++i) {
-            auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
-            auto image_name = il2cpp_image_get_name(image);
-            imageStr << "\n// Dll : " << image_name;
-            //LOGD("image name : %s", image->name);
-            auto imageName = std::string(image_name);
-            auto pos = imageName.rfind('.');
-            auto imageNameNoExt = imageName.substr(0, pos);
-            auto assemblyFileName = il2cpp_string_new(imageNameNoExt.data());
-            auto reflectionAssembly = ((Assembly_Load_ftn) assemblyLoad->methodPointer)(nullptr,
-                                                                                        assemblyFileName,
-                                                                                        nullptr);
-            auto reflectionTypes = ((Assembly_GetTypes_ftn) assemblyGetTypes->methodPointer)(
-                    reflectionAssembly, nullptr);
-            auto items = reflectionTypes->vector;
-            for (int j = 0; j < reflectionTypes->max_length; ++j) {
-                auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
-                auto type = il2cpp_class_get_type(klass);
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
-            }
-        }
-    }
-    LOGI("write dump file");
-    auto outPath = std::string(outDir).append("/files/dump.cs");
-    std::ofstream outStream(outPath);
-    outStream << imageOutput.str();
-    auto count = outPuts.size();
-    for (int i = 0; i < count; ++i) {
-        outStream << outPuts[i];
-    }
-    outStream.close();
-    LOGI("Dump finished: %s", outPath.c_str());
+    LOGI("Dump finished: %zu classes, %s", written, finalPath.c_str());
 }
