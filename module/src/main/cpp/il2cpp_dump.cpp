@@ -27,6 +27,48 @@
 
 static uint64_t il2cpp_base = 0;
 
+static void scan_metadata_registration(const char *outDir) {
+    std::ifstream maps("/proc/self/maps");
+    if (!maps) return;
+    struct Range { uint64_t start, end; };
+    std::vector<Range> ranges;
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("libil2cpp.so") == std::string::npos) continue;
+        uint64_t start = 0, end = 0; char perms[5] = {};
+        if (sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) == 3 &&
+            end > start && perms[0] == 'r') ranges.push_back({start, end});
+    }
+    auto inRange = [&ranges](uint64_t p) {
+        for (const auto &r : ranges) if (p >= r.start && p < r.end) return true;
+        return false;
+    };
+    for (const auto &r : ranges) {
+        for (uint64_t p = (r.start + 7) & ~7ULL; p + 7 * 16 <= r.end; p += 8) {
+            bool valid = true;
+            for (int i = 0; i < 7; ++i) {
+                auto count = *reinterpret_cast<const uint32_t *>(p + i * 16);
+                auto ptr = *reinterpret_cast<const uint64_t *>(p + i * 16 + 8);
+                if (count < 1000 || count > 300000 || !inRange(ptr)) { valid = false; break; }
+            }
+            if (valid) {
+                auto path = std::string(outDir).append("/files/metadata_registration.txt");
+                std::ofstream out(path);
+                out << "address=0x" << std::hex << p << "\n";
+                for (int i = 0; i < 7; ++i) {
+                    out << "field" << i << "_count=" << std::dec
+                        << *reinterpret_cast<const uint32_t *>(p + i * 16)
+                        << " ptr=0x" << std::hex
+                        << *reinterpret_cast<const uint64_t *>(p + i * 16 + 8) << "\n";
+                }
+                LOGI("Metadata registration candidate: 0x%" PRIx64, p);
+                return;
+            }
+        }
+    }
+    LOGI("No metadata registration candidate found");
+}
+
 static void dump_runtime_il2cpp(const char *outDir) {
     auto outPath = std::string(outDir).append("/files/libil2cpp_runtime.bin");
     std::ofstream out(outPath, std::ios::binary);
@@ -409,6 +451,7 @@ void il2cpp_dump(const char *outDir) {
     sample << "il2cpp_base=0x" << std::hex << il2cpp_base << "\n";
     sample.close();
     LOGI("Runtime sample marker written: %s", samplePath.c_str());
+    scan_metadata_registration(outDir);
     dump_runtime_il2cpp(outDir);
     return;
 
